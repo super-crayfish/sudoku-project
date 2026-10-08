@@ -96,9 +96,9 @@ async function ensureOpened(id) {
 }
 
 let creating = null; // 并发创建合并
-async function createSession() {
+function newSessionRec() {
   if (creating) return creating;
-  creating = (async () => {
+  const p = (async () => {
     const { session } = await createAgentSession({
       sessionManager: SessionManager.create(CWD, SESSION_DIR),
     });
@@ -114,7 +114,26 @@ async function createSession() {
     console.log("新会话:", id);
     return id;
   })();
-  try { return await creating; } finally { creating = null; }
+  const done = () => { if (creating === p) creating = null; };
+  p.then(done, done);
+  return p;
+}
+
+let spareRec = null, sparePromise = null;
+function prewarm() {
+  if (spareRec || sparePromise) return;
+  sparePromise = newSessionRec()
+    .then(rec => { spareRec = rec; sparePromise = null; })
+    .catch(() => { sparePromise = null; });
+}
+async function createSession() {
+  if (!spareRec) prewarm();
+  if (sparePromise) await sparePromise;
+  const rec = spareRec;
+  if (!rec) return await newSessionRec(); // 兜底
+  spareRec = null;
+  prewarm(); // 立刻补充下一个备用，用户永远不用等
+  return rec;
 }
 
 function extractText(content) {
@@ -356,7 +375,7 @@ process.on("uncaughtException", (e) => console.log("[uncaughtException]", e?.mes
 /* ---- 启动 ---- */
 await refreshEntries();
 if (entries.length === 0) {
-  await createSession();
+  await newSessionRec();
 } else {
   const first = entries.slice().sort((a, b) => updatedOf(b.id) - updatedOf(a.id))[0];
   const rec = await ensureOpened(first.id).catch(() => null);
@@ -365,6 +384,7 @@ if (entries.length === 0) {
     defaultProvider = rec.session.model.provider || "";
   }
 }
+prewarm(); // 预热备用会话，新建零等待
 server.keepAliveTimeout = 120000;
 server.headersTimeout = 125000;
 server.requestTimeout = 0;
