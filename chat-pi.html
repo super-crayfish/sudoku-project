@@ -736,8 +736,12 @@ function ask(text, isRetry){
       return;
     }
     resetBusy();
+    var emsg = e.message || "";
     var hint = (e.status === 413) ? "请求体积超限，请减少图片张数" :
-               (e.status === 429) ? "上一条还在生成中" : "桥接可能未运行：Termux 项目目录里执行 sh serve.sh";
+               (e.status === 429) ? "上一条还在生成中" :
+               (/insufficient_user_quota|预扣费/.test(emsg)) ? "该模型供应商余额不足，请点 ☰ 抽屉换一个模型" :
+               (e.status === 404 && !isRetry) ? "" :
+               "桥接可能未运行：Termux 项目目录里执行 sh serve.sh";
     bubble.innerHTML = "⚠ " + esc(e.message || "请求失败") +
       '<br><span style="font-size:11px;color:#999">' + hint + '</span>';
     var msgDiv = bubble.parentElement;

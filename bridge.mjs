@@ -132,7 +132,7 @@ async function createSession() {
   const rec = spareRec;
   if (!rec) return await newSessionRec(); // 兜底
   spareRec = null;
-  prewarm(); // 立刻补充下一个备用，用户永远不用等
+  prewarm(); // 立刻补充下一个备用
   return rec;
 }
 
@@ -401,7 +401,7 @@ if (entries.length === 0) {
     defaultProvider = rec.session.model.provider || "";
   }
 }
-prewarm(); // 预热备用会话，新建零等待
+prewarm(); // 预热备用会话
 server.keepAliveTimeout = 120000;
 server.headersTimeout = 125000;
 server.requestTimeout = 0;
