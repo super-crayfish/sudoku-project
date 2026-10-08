@@ -314,7 +314,7 @@ async function route(req, res) {
       saveMeta();
     }
     log("POST /chat done");
-    res.end();
+    return res.end();
   }
 
   if (req.method === "POST" && url === "/abort") {
