@@ -157,7 +157,7 @@ const MIME = {
   ".png": "image/png", ".jpg": "image/jpeg", ".svg": "image/svg+xml",
   ".ico": "image/x-icon", ".json": "application/json",
 };
-const STATIC_ALLOWED = new Set(["/chat-pi.html", "/chat.html", "/sudoku.html"]);
+const STATIC_ALLOWED = new Set(["/chat-pi.html", "/chat-direct.html", "/chat.html", "/sudoku.html"]);
 function serveStatic(req, res) {
   let p;
   try { p = decodeURIComponent(req.url.split("?")[0]); } catch { res.writeHead(400); return res.end("bad request"); }
@@ -176,6 +176,21 @@ async function route(req, res) {
   const u = new URL(req.url, "http://localhost");
   const url = u.pathname;
   const log = (...a) => console.log(new Date().toLocaleTimeString(), ...a);
+
+  // 安全：仅接受来自本机页面的请求，阻止跨站请求伪造(CSRF)与 DNS rebinding
+  const host = (req.headers.host || "").replace(/:\d+$/, "");
+  if (host && host !== "127.0.0.1" && host !== "localhost" && host !== "[::1]" && host !== "::1") {
+    res.writeHead(403); return res.end("forbidden host");
+  }
+  const origin = req.headers.origin;
+  if (origin) {
+    let ok = false;
+    try {
+      const o = new URL(origin);
+      ok = o.hostname === "127.0.0.1" || o.hostname === "localhost" || o.hostname === "::1" || o.hostname === "[::1]";
+    } catch {}
+    if (!ok) { res.writeHead(403); return res.end("forbidden origin"); }
+  }
 
   if (req.method === "GET" && url === "/sessions") {
     await refreshEntries();
@@ -240,7 +255,17 @@ async function route(req, res) {
     let msg;
     try { msg = JSON.parse(body || "{}"); } catch { msg = {}; }
     const message = (msg.message || "").trim();
-    if (!message) { res.writeHead(400); return res.end("empty message"); }
+    // 图片附件（最多3张，单张≤4MB base64）—— 必须在 writeHead 之前校验，
+    // 否则响应头已发送，无法再返回 400，且 busy 标志会残留导致永久 429
+    let images;
+    if (Array.isArray(msg.images) && msg.images.length) {
+      const OK_TYPES = new Set(["image/png", "image/jpeg", "image/webp", "image/gif"]);
+      images = msg.images.slice(0, 3)
+        .filter(im => im && im.data && OK_TYPES.has(im.mediaType) && im.data.length <= 5600000)
+        .map(im => ({ type: "image", data: String(im.data), mimeType: im.mediaType }));
+      if (!images.length) { res.writeHead(400); return res.end("图片无效（仅支持 png/jpeg/webp/gif，单张≤4MB）"); }
+    }
+    if (!message && !images) { res.writeHead(400); return res.end("empty message"); }
     if (busy) { res.writeHead(429); return res.end("上一条还在生成中，稍等"); }
     const rec = await ensureOpened(msg.id);
     if (!rec) { res.writeHead(404); return res.end("会话不存在（桥接可能已重启），请新建对话"); }
@@ -274,30 +299,22 @@ async function route(req, res) {
         send({ t: "think", d: e.assistantMessageEvent.delta });
       }
     });
-    // 图片附件（最多3张，单张≤4MB base64）
-    let images;
-    if (Array.isArray(msg.images) && msg.images.length) {
-      const OK_TYPES = new Set(["image/png", "image/jpeg", "image/webp", "image/gif"]);
-      images = msg.images.slice(0, 3)
-        .filter(im => im && im.data && OK_TYPES.has(im.mediaType) && im.data.length <= 5600000)
-        .map(im => ({ type: "image", data: String(im.data), mimeType: im.mediaType }));
-      if (!images.length) { res.writeHead(400); return res.end("图片无效（仅支持 png/jpeg/webp/gif，单张≤4MB）"); }
-    }
     log("POST /chat", rec.id, `len=${message.length}${images?.length ? " +" + images.length + "图" : ""}`);
     try {
       await rec.session.prompt(message, images?.length ? { images } : undefined);
     } catch (err) {
       send({ t: "error", d: err?.message || String(err) });
+    } finally {
+      unsub();
+      clearTimeout(watchdog);
+      done = true;
+      busy = false;
+      busyId = null;
+      meta[rec.id].updatedAt = Date.now();
+      saveMeta();
     }
-    unsub();
-    clearTimeout(watchdog);
-    done = true;
-    busy = false;
-    busyId = null;
-    meta[rec.id].updatedAt = Date.now();
-    saveMeta();
     log("POST /chat done");
-    return res.end();
+    res.end();
   }
 
   if (req.method === "POST" && url === "/abort") {

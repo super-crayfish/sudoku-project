@@ -5,10 +5,14 @@ PORT="${2:-8080}"
 case "$1" in
   glm)     P=zai-coding-cn; M=glm-5.3-flash ;;
   astra|gpt) P=agentrouter; M=gpt-6-astra ;;
+  opus55)
+    P=railway; M=claude-opus-5-5 ;;
+  sonnet55)
+    P=railway; M=claude-sonnet-5-5 ;;
   zenmux)  P=zenmux; M=anthropic/claude-sonnet-5.5:google-vertex ;;
   gpt55)   P=vectorengine; M=gpt-5.5 ;;
   sonnet5) P=vectorengine; M=claude-sonnet-5 ;;
-  *) echo "用法: sh use-model.sh [glm|astra|zenmux|gpt55|sonnet5] [端口]"; exit 1 ;;
+  *) echo "用法: sh use-model.sh [glm|astra|zenmux|gpt55|sonnet5|opus55|sonnet55] [端口]"; exit 1 ;;
 esac
 python3 - "$P" "$M" <<'PY'
 import json, sys
