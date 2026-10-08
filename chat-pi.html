@@ -106,6 +106,31 @@ header h1 { font-size:17px; color:var(--text); flex:1; white-space:nowrap; overf
 #send:disabled { opacity:.4; }
 #send.stop { background:#e74c3c; }
 
+/* ---------- 朗读 ---------- */
+.speak-btn {
+  border:none; background:none; color:var(--text-faint); font-size:14px;
+  cursor:pointer; padding:4px 8px; align-self:flex-start; margin-top:2px;
+  flex-shrink:0;
+}
+.speak-btn:active { color:var(--accent); }
+
+/* ---------- 图片附件 ---------- */
+#previews {
+  display:none; gap:8px; padding:0 4px 8px; overflow-x:auto;
+  width:100%;
+}
+.thumb { position:relative; flex-shrink:0; }
+.thumb img {
+  width:56px; height:56px; object-fit:cover; border-radius:8px;
+  border:1px solid var(--border);
+}
+.thumb button {
+  position:absolute; top:-6px; right:-6px; width:20px; height:20px;
+  border:none; border-radius:50%; background:#e74c3c; color:#fff;
+  font-size:11px; cursor:pointer; line-height:1;
+}
+#attachBtn { font-size:18px; }
+
 /* ---------- 会话抽屉 ---------- */
 #mask { position:fixed; inset:0; background:rgba(0,0,0,.4); z-index:98; display:none; }
 #mask.show { display:block; }
@@ -164,8 +189,13 @@ header h1 { font-size:17px; color:var(--text); flex:1; white-space:nowrap; overf
   </div>
 
   <div id="composer">
-    <textarea id="input" rows="1" placeholder="输入消息…"></textarea>
-    <button id="send">➤</button>
+    <div id="previews"></div>
+    <div style="display:flex;align-items:flex-end;gap:8px;width:100%">
+      <button class="iconbtn" id="attachBtn" title="上传图片">📎</button>
+      <input type="file" id="fileInput" accept="image/*" multiple hidden>
+      <textarea id="input" rows="1" placeholder="输入消息…"></textarea>
+      <button id="send">➤</button>
+    </div>
   </div>
 </div>
 
@@ -268,7 +298,8 @@ function openSession(id, silent){
         return;
       }
       for (var i=0;i<msgs.length;i++){
-        addMsg(msgs[i].role === "user" ? "user" : "bot", mdRender(msgs[i].content));
+        var d = addMsg(msgs[i].role === "user" ? "user" : "bot", mdRender(msgs[i].content));
+        if (msgs[i].role !== "user") addSpeakBtn(d);
       }
       scrollBottom();
     })
@@ -325,6 +356,90 @@ $("sessionList").addEventListener("click", function(e){
   if (open && !busy) openSession(open);
 });
 
+/* ---------- 朗读（系统TTS） ---------- */
+function addSpeakBtn(msgDiv){
+  if (!msgDiv || msgDiv.querySelector(".speak-btn")) return;
+  var sb = document.createElement("button");
+  sb.className = "speak-btn"; sb.textContent = "🔊"; sb.title = "朗读";
+  msgDiv.appendChild(sb);
+}
+try { speechSynthesis.getVoices(); } catch(e){}
+$("messages").addEventListener("click", function(e){
+  var b = e.target.closest ? e.target.closest(".speak-btn") : null;
+  if (!b) return;
+  if (window.speechSynthesis && speechSynthesis.speaking) {
+    speechSynthesis.cancel(); b.textContent = "🔊"; return;
+  }
+  if (!window.speechSynthesis) { b.textContent = "❌"; return; }
+  var bubble = b.closest(".msg").querySelector(".bubble");
+  var clone = bubble.cloneNode(true);
+  var tk = clone.querySelector(".think"); if (tk) tk.remove();
+  Array.prototype.forEach.call(clone.querySelectorAll("pre"), function(x){ x.remove(); });
+  var txt = clone.textContent.replace(/\s+/g, " ").trim().slice(0, 3000);
+  if (!txt) return;
+  var u = new SpeechSynthesisUtterance(txt);
+  u.lang = "zh-CN"; u.rate = 1;
+  var vs = speechSynthesis.getVoices();
+  for (var i = 0; i < vs.length; i++){
+    if (/^zh|cmn|Chinese/i.test(vs[i].lang)) { u.voice = vs[i]; break; }
+  }
+  u.onend = function(){ b.textContent = "🔊"; };
+  u.onerror = function(){ b.textContent = "🔊"; };
+  b.textContent = "⏹";
+  speechSynthesis.speak(u);
+});
+
+/* ---------- 图片附件 ---------- */
+var pendingImages = [], askImages = [];
+$("attachBtn").onclick = function(){ $("fileInput").click(); };
+$("fileInput").addEventListener("change", function(){
+  var files = Array.prototype.slice.call(this.files || []);
+  this.value = "";
+  files.forEach(function(f){
+    if (!/^image\//.test(f.type)) return;
+    if (f.size > 20 * 1024 * 1024) { alert("图片不能超过 20MB：" + f.name); return; }
+    if (pendingImages.length >= 3) { alert("最多同时附 3 张图片"); return; }
+    compressImage(f, function(mediaType, b64){
+      pendingImages.push({ mediaType: mediaType, data: b64 });
+      renderPreviews();
+    });
+  });
+});
+function compressImage(file, done){
+  var r = new FileReader();
+  r.onload = function(){
+    var img = new Image();
+    img.onload = function(){
+      var MAX = 2000, w = img.width, h = img.height;
+      if (w <= MAX && h <= MAX && file.size <= 1536*1024) {
+        done(file.type || "image/png", String(r.result).split(",")[1] || ""); return;
+      }
+      var scale = Math.min(1, MAX / Math.max(w, h));
+      var cv = document.createElement("canvas");
+      cv.width = Math.round(w*scale); cv.height = Math.round(h*scale);
+      cv.getContext("2d").drawImage(img, 0, 0, cv.width, cv.height);
+      var out = cv.toDataURL("image/jpeg", 0.85);
+      done("image/jpeg", out.split(",")[1] || "");
+    };
+    img.onerror = function(){ done(file.type || "image/png", String(r.result).split(",")[1] || ""); };
+    img.src = r.result;
+  };
+  r.readAsDataURL(file);
+}
+function renderPreviews(){
+  var h = "";
+  for (var i = 0; i < pendingImages.length; i++){
+    h += '<span class="thumb"><img src="data:' + pendingImages[i].mediaType + ';base64,' + pendingImages[i].data + '" alt="图"><button data-rm="' + i + '">✕</button></span>';
+  }
+  var pv = $("previews");
+  pv.innerHTML = h;
+  pv.style.display = pendingImages.length ? "flex" : "none";
+}
+$("previews").addEventListener("click", function(e){
+  var rm = e.target.getAttribute ? e.target.getAttribute("data-rm") : null;
+  if (rm !== null && rm !== undefined) { pendingImages.splice(Number(rm), 1); renderPreviews(); }
+});
+
 /* ---------- 输入 & 发送 ---------- */
 var input = $("input");
 input.addEventListener("input", function(){
@@ -334,9 +449,17 @@ input.addEventListener("input", function(){
 $("send").onclick = function(){ busy ? stopGen() : send(); };
 
 function mdRender(t){
-  var esc2 = t.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
-  return esc2
-    .replace(/```(\w*)\n?([\s\S]*?)```/g, function(m,l,c){ return '<pre><code>'+c.replace(/\n$/,"")+'</code></pre>'; })
+  var esc = t.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+  var out = esc
+    .replace(/```(\w*)\n?([\s\S]*?)```/g, function(m,l,c){ return '<pre><code>'+c.replace(/\n$/,"")+'</code></pre>'; });
+  // 流式中未闭合的代码块：尾部剩余 ``` 当场渲染为代码块
+  var open = out.split("```").length - 1;
+  if (open % 2 === 1) {
+    var idx = out.lastIndexOf("```");
+    var lang = out.slice(idx+3).match(/^\w*\n?/)[0];
+    out = out.slice(0, idx) + '<pre><code>' + out.slice(idx+3+lang.length) + '</code></pre>';
+  }
+  return out
     .replace(/`([^`\n]+)`/g, "<code>$1</code>")
     .replace(/\*\*([^*\n]+)\*\*/g, "<b>$1</b>");
 }
@@ -353,11 +476,15 @@ function scrollBottom(){ $("messages").scrollTop = $("messages").scrollHeight; }
 
 function send(){
   var text = input.value.trim();
-  if (!text || busy) return;
+  var hasImgs = pendingImages.length > 0;
+  if ((!text && !hasImgs) || busy) return;
   if (creatingSession) { addMsg("err", "⏳ 新会话创建中，请稍候 1~2 秒再发"); return; }
   if (!currentId) { createSession(); return; }
+  var imgs = pendingImages.slice();
+  pendingImages = []; renderPreviews();
   input.value = ""; input.style.height = "auto";
-  addMsg("user", mdRender(text));
+  addMsg("user", mdRender(text) + (imgs.length ? " 📎×" + imgs.length : ""));
+  askImages = imgs;
   ask(text);
 }
 
@@ -384,7 +511,7 @@ function ask(text, isRetry){
     return fetch("/chat", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ message: text, id: currentId })
+      body: JSON.stringify({ message: text, id: currentId, images: askImages })
     }).then(function(res){
       if (!res.ok) return res.text().then(function(t){
         var err = new Error(t || ("HTTP " + res.status));
@@ -430,13 +557,14 @@ function ask(text, isRetry){
           return attempt();
         });
       }).catch(function(e2){
-        bubble.innerHTML = "⚠ " + (e2.message || "自动恢复失败") +
+        bubble.innerHTML = "⚠ " + esc(e2.message || "自动恢复失败") +
           '<br><span style="font-size:11px;color:#999">桥接可能未运行：Termux 里执行 sh ~/snake/serve.sh</span>';
       });
       return;
     }
-    bubble.innerHTML = "⚠ " + (e.message || "请求失败") +
-      '<br><span style="font-size:11px;color:#999">桥接可能未运行：Termux 里执行 sh ~/snake/serve.sh</span>';
+    var hint = (e.status === 413) ? "图片总体积超限，请减少张数后重试" : "桥接可能未运行：Termux 里执行 sh ~/snake/serve.sh";
+    bubble.innerHTML = "⚠ " + esc(e.message || "请求失败") +
+      '<br><span style="font-size:11px;color:#999">' + hint + '</span>';
   });
   function finish(){
     if (acc) {
@@ -446,6 +574,7 @@ function ask(text, isRetry){
     }
     busy = false;
     btn.textContent = "➤"; btn.classList.remove("stop");
+    addSpeakBtn(bubble.parentElement);
     scrollBottom();
     refreshSessions();
   }

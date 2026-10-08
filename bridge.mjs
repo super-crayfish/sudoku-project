@@ -51,7 +51,7 @@ async function refreshEntries() {
   }
   if (changed) saveMeta();
 }
-function entryOf(id) { return entries.find(e => e.id === id) || entries.find(e => e.id && id && e.id.startsWith(id)); }
+function entryOf(id) { return id ? entries.find(e => e.id === id) : undefined; }
 function nameOf(id) {
   if (meta[id]?.name) return meta[id].name;
   const f = entryOf(id)?.firstMessage;
@@ -126,10 +126,10 @@ function serveStatic(req, res) {
   let p = decodeURIComponent(req.url.split("?")[0]);
   if (p === "/") p = "/chat-pi.html";
   const file = path.normalize(path.join(ROOT, p));
-  if (!file.startsWith(ROOT)) { res.writeHead(403); return res.end(); }
+  if (file !== ROOT && !file.startsWith(ROOT + path.sep)) { res.writeHead(403); return res.end(); }
   fs.readFile(file, (err, data) => {
     if (err) { res.writeHead(404); return res.end("Not Found"); }
-    res.writeHead(200, { "Content-Type": MIME[path.extname(file)] || "application/octet-stream" });
+    res.writeHead(200, { "Content-Type": MIME[path.extname(file)] || "application/octet-stream", "Cache-Control": "no-cache, no-store, must-revalidate" });
     res.end(data);
   });
 }
@@ -194,7 +194,10 @@ const server = http.createServer(async (req, res) => {
 
   if (req.method === "POST" && url === "/chat") {
     let body = "";
-    for await (const c of req) body += c;
+    for await (const c of req) {
+      body += c;
+      if (body.length > 20971520) { res.writeHead(413); return res.end("请求体过大（上限20MB）"); }
+    }
     let msg;
     try { msg = JSON.parse(body || "{}"); } catch { msg = {}; }
     const message = (msg.message || "").trim();
@@ -230,9 +233,20 @@ const server = http.createServer(async (req, res) => {
         send({ t: "think", d: e.assistantMessageEvent.delta });
       }
     });
-    log("POST /chat", rec.id, `"${message.slice(0, 20)}"`);
+    // 图片附件（最多3张，单张≤4MB base64）
+    let images;
+    if (Array.isArray(msg.images)) {
+      images = msg.images.slice(0, 3)
+        .filter(im => im && im.data)
+        .map(im => ({
+          type: "image",
+          data: String(im.data),
+          mimeType: im.mediaType || "image/png",
+        }));
+    }
+    log("POST /chat", rec.id, `"${message.slice(0, 20)}"${images?.length ? ` +${images.length}图` : ""}`);
     try {
-      await rec.session.prompt(message);
+      await rec.session.prompt(message, images?.length ? { images } : undefined);
     } catch (err) {
       send({ t: "error", d: err?.message || String(err) });
     }
@@ -274,7 +288,7 @@ if (entries.length === 0) {
 server.keepAliveTimeout = 120000;
 server.headersTimeout = 125000;
 server.requestTimeout = 0;
-server.listen(PORT, () => {
+server.listen(PORT, "127.0.0.1", () => {
   console.log(`✅ pi-bridge 就绪: http://localhost:${PORT}/chat-pi.html`);
   console.log(`   磁盘会话: ${entries.length} 个 (${SESSION_DIR})`);
 });
