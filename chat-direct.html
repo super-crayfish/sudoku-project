@@ -166,6 +166,7 @@ var ctrl = null;
 function send(){
   var text = input.value.trim();
   if (!text || busy) return;
+  if (!cfg.key) { addMsg("err", "⚠ 请先点 ⚙ 设置 API Key"); return; }
   input.value = ""; input.style.height = "auto";
   addMsg("user", mdRender(text));
   history.push({ role:"user", content:text });
@@ -186,7 +187,7 @@ function send(){
     method: "POST",
     signal: ctrl.signal,
     headers: { "content-type":"application/json", "authorization":"Bearer " + cfg.key },
-    body: JSON.stringify({ model: cfg.model, max_tokens: 8192, messages: history })
+    body: JSON.stringify({ model: cfg.model, max_tokens: 8192, messages: history, stream: true })
   }).then(function(res){
     if (!res.ok) return res.text().then(function(t){
       var msg = "HTTP " + res.status;

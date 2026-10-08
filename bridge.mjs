@@ -31,7 +31,7 @@ const SESSION_DIR = path.join(os.homedir(), ".pi", "chat-sessions");
 const META_FILE = path.join(ROOT, "sessions-meta.json");
 const SETTINGS_FILE = path.join(os.homedir(), ".pi", "agent", "settings.json");
 const MODELS_FILE = path.join(os.homedir(), ".pi", "agent", "models.json");
-const MAX_OPENED = 4; // 同时驻留内存的会话数
+const MAX_OPENED = 6; // 同时驻留内存的会话数
 
 fs.mkdirSync(SESSION_DIR, { recursive: true });
 
@@ -250,7 +250,7 @@ async function route(req, res) {
     req.setEncoding("utf8");
     for await (const c of req) {
       body += c;
-      if (body.length > 20971520) { res.writeHead(413); return res.end("请求体过大（上限20MB）"); }
+      if (body.length > 10485760) { res.writeHead(413); return res.end("请求体过大（上限10MB）"); }
     }
     let msg;
     try { msg = JSON.parse(body || "{}"); } catch { msg = {}; }
@@ -289,8 +289,8 @@ async function route(req, res) {
       if (!done) { log("客户端断开 → 中止生成"); try { rec.session.abort(); } catch {} }
     });
     const watchdog = setTimeout(() => {
-      if (!done) { log("生成超时(5分钟) → 中止"); try { rec.session.abort(); } catch {} }
-    }, 600000);
+      if (!done) { log("生成超时(8分钟) → 中止"); try { rec.session.abort(); } catch {} }
+    }, 480000);
     const unsub = rec.session.subscribe((e) => {
       const t = e.assistantMessageEvent?.type;
       if (e.type === "message_update" && t === "text_delta") {
