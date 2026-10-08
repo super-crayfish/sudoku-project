@@ -5,7 +5,13 @@ PORT="${1:-8080}"
 
 # 先清掉旧实例：优先用 PID 文件，避免 pkill 误伤命令行里含同名关键字的进程
 PIDFILE="$HOME/.pi-bridge.pid"
-[ -f "$PIDFILE" ] && kill "$(cat "$PIDFILE")" 2>/dev/null
+if [ -f "$PIDFILE" ]; then
+  OLDPID="$(cat "$PIDFILE")"
+  # 校验 cmdline 确实是本项目的桥接，防止误杀别的工作进程
+  if [ -n "$OLDPID" ] && grep -qa "bridge.mjs" "/proc/$OLDPID/cmdline" 2>/dev/null; then
+    kill "$OLDPID" 2>/dev/null
+  fi
+fi
 pkill -f "http.server $PORT" 2>/dev/null
 sleep 0.5
 

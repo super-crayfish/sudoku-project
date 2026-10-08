@@ -1,59 +1,31 @@
 #!/data/data/com.termux/files/usr/bin/sh
-# 用法: sh use-model.sh glm | astra | zenmux
+# 用法: sh use-model.sh [glm|astra|zenmux|gpt55|sonnet5] [端口]
+DIR="$(cd "$(dirname "$0")" && pwd)"
+PORT="${2:-8080}"
 case "$1" in
-  glm)
-    cp ~/.pi/agent/settings.json.glm-backup ~/.pi/agent/settings.json
-    echo "✅ 已切换: GLM-5.3-Flash (zai-coding-cn)" ;;
-  astra|gpt)
-    python3 - <<'PY'
-import json
-p = "/data/data/com.termux/files/home/.pi/agent/settings.json"
-cfg = json.load(open(p))
-cfg["defaultProvider"] = "agentrouter"
-cfg["defaultModel"] = "gpt-6-astra"
-json.dump(cfg, open(p, "w"), indent=2, ensure_ascii=False)
-print("✅ 已切换: gpt-6-astra (agentrouter)")
-PY
-    ;;
-  gpt55)
-    python3 - <<'PY'
-import json
-p = "/data/data/com.termux/files/home/.pi/agent/settings.json"
-cfg = json.load(open(p))
-cfg["defaultProvider"] = "vectorengine"
-cfg["defaultModel"] = "gpt-5.5"
-json.dump(cfg, open(p, "w"), indent=2, ensure_ascii=False)
-print("✅ 已切换: gpt-5.5 (vectorengine)")
-PY
-    ;;
-  sonnet5)
-    python3 - <<'PY'
-import json
-p = "/data/data/com.termux/files/home/.pi/agent/settings.json"
-cfg = json.load(open(p))
-cfg["defaultProvider"] = "vectorengine"
-cfg["defaultModel"] = "claude-sonnet-5"
-json.dump(cfg, open(p, "w"), indent=2, ensure_ascii=False)
-print("✅ 已切换: claude-sonnet-5 (vectorengine)")
-PY
-    ;;
-  zenmux)
-    python3 - <<'PY'
-import json
-p = "/data/data/com.termux/files/home/.pi/agent/settings.json"
-cfg = json.load(open(p))
-cfg["defaultProvider"] = "zenmux"
-cfg["defaultModel"] = "anthropic/claude-sonnet-5.5:google-vertex"
-json.dump(cfg, open(p, "w"), indent=2, ensure_ascii=False)
-print("✅ 已切换: claude-sonnet-5.5 (zenmux)")
-PY
-    ;;
-  *)
-    echo "用法: sh use-model.sh glm|astra|zenmux|gpt55|sonnet5"
-    exit 1 ;;
+  glm)     P=zai-coding-cn; M=glm-5.3-flash ;;
+  astra|gpt) P=agentrouter; M=gpt-6-astra ;;
+  zenmux)  P=zenmux; M=anthropic/claude-sonnet-5.5:google-vertex ;;
+  gpt55)   P=vectorengine; M=gpt-5.5 ;;
+  sonnet5) P=vectorengine; M=claude-sonnet-5 ;;
+  *) echo "用法: sh use-model.sh [glm|astra|zenmux|gpt55|sonnet5] [端口]"; exit 1 ;;
 esac
-pkill -f "node .*bridge[.]mjs" 2>/dev/null
+python3 - "$P" "$M" <<'PY'
+import json, sys
+prov, model = sys.argv[1], sys.argv[2]
+p = "/data/data/com.termux/files/home/.pi/agent/settings.json"
+try: cfg = json.load(open(p))
+except Exception: cfg = {}
+cfg["defaultProvider"] = prov
+cfg["defaultModel"] = model
+json.dump(cfg, open(p, "w"), indent=2, ensure_ascii=False)
+print(f"✅ 已切换: {model} ({prov})")
+PY
+# 精准清理旧桥接（校验 cmdline，防止误杀）
+for pid in $(pgrep -f "bridge[.]mjs"); do
+  if grep -qa "bridge.mjs" "/proc/$pid/cmdline" 2>/dev/null; then kill "$pid" 2>/dev/null; fi
+done
 sleep 1
-cd ~/snake && nohup node bridge.mjs 8080 > ~/http.log 2>&1 &
+nohup node "$DIR/bridge.mjs" "$PORT" > "$HOME/http.log" 2>&1 &
 sleep 6
-curl -s http://localhost:8080/info
+curl -s --max-time 3 "http://localhost:$PORT/info" || echo "（启动中，稍候刷新）"

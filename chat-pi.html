@@ -206,6 +206,12 @@ header h1 { font-size:17px; color:var(--text); flex:1; white-space:nowrap; overf
     <div class="s" id="drawerInfo"></div>
   </div>
   <button id="newSessionBtn">✚ 新对话</button>
+  <div style="padding:0 12px 4px;">
+    <div style="font-size:12px;color:var(--text-dim);margin:6px 0 4px;">模型（切换后即时生效）</div>
+    <select id="modelSel" style="width:100%;padding:8px;border-radius:8px;border:1px solid var(--input-border);background:var(--input-bg);color:var(--text);font-size:13px;">
+      <option>加载中…</option>
+    </select>
+  </div>
   <div id="sessionList"></div>
 </div>
 
@@ -237,6 +243,33 @@ fetch("/info").then(r=>r.json()).then(function(info){
 }).catch(function(){
   $("modelBadge").textContent = "桥接离线";
 });
+
+function loadModels(){
+  fetch("/models").then(r=>r.json()).then(function(d){
+    var sel = $("modelSel");
+    sel.innerHTML = "";
+    var curKey = (d.current.provider||"") + "|" + (d.current.model||"");
+    (d.list||[]).forEach(function(m){
+      var key = m.provider + "|" + m.model;
+      var o = document.createElement("option");
+      o.value = key; o.textContent = m.name;
+      if (key === curKey) o.selected = true;
+      sel.appendChild(o);
+    });
+    if (!sel.options.length) sel.innerHTML = '<option>无可用模型</option>';
+  }).catch(function(){});
+}
+$("modelSel").onchange = function(){
+  var parts = this.value.split("|");
+  if (parts.length < 2) return;
+  fetch("/model", { method:"POST", headers:{"content-type":"application/json"},
+    body: JSON.stringify({ provider: parts[0], model: parts[1], id: currentId }) })
+  .then(r=>r.json()).then(function(d){
+    $("modelBadge").textContent = parts[1];
+    $("drawerInfo").textContent = parts[1] + " · " + sessions.length + " 个会话";
+    if (!d.live) { addMsg("err", "ℹ 当前供应商不支持对话中途切换，已自动新建对话使用新模型"); createSession(); }
+  }).catch(function(){ alert("切换失败"); });
+};
 
 initSessions();
 function initSessions(){
@@ -344,7 +377,7 @@ function deleteSession(id){
   }).finally(function(){ deletingSession = false; });
 }
 
-$("menuBtn").onclick = function(){ $("drawer").classList.add("open"); $("mask").classList.add("show"); refreshSessions(); };
+$("menuBtn").onclick = function(){ $("drawer").classList.add("open"); $("mask").classList.add("show"); refreshSessions(); loadModels(); };
 $("mask").onclick = closeDrawer;
 function closeDrawer(){ $("drawer").classList.remove("open"); $("mask").classList.remove("show"); }
 $("newSessionBtn").onclick = function(){ closeDrawer(); if (!busy) createSession(); };
@@ -364,30 +397,62 @@ function addSpeakBtn(msgDiv){
   msgDiv.appendChild(sb);
 }
 try { speechSynthesis.getVoices(); } catch(e){}
+var speakState = { btn: null };
+function setSpeakIcons(t){
+  Array.prototype.forEach.call(document.querySelectorAll(".speak-btn"), function(x){ x.textContent = t; });
+}
+function cleanSpeakText(clone){
+  Array.prototype.forEach.call(clone.querySelectorAll("pre"), function(x){ x.remove(); });
+  var t = clone.textContent || "";
+  t = t.replace(/https?:\/\/\S+/g, "，这里有个链接，略。")
+       .replace(/`([^`]*)`/g, "$1")
+       .replace(/[*#>|_]+/g, " ")
+       .replace(/\s+/g, " ").trim();
+  return t.slice(0, 3000);
+}
+function chunkSpeak(t){
+  var out = [], cur = "";
+  var segs = t.split(/(。|！|!|？|\?|；|;|\n)/);
+  for (var i = 0; i < segs.length; i++){
+    cur += segs[i];
+    if (cur.length >= 120 && /[。！！？?；;\n]$/.test(cur)) { out.push(cur); cur = ""; }
+    else if (cur.length >= 200) { out.push(cur); cur = ""; }
+  }
+  if (cur.trim()) out.push(cur);
+  return out.filter(function(s){ return s.trim(); });
+}
 $("messages").addEventListener("click", function(e){
   var b = e.target.closest ? e.target.closest(".speak-btn") : null;
-  if (!b) return;
-  if (window.speechSynthesis && speechSynthesis.speaking) {
-    speechSynthesis.cancel(); b.textContent = "🔊"; return;
+  if (!b || !window.speechSynthesis) return;
+  function setAll(t){ setSpeakIcons(t); }
+  // 暂停中 → 续播
+  if (speechSynthesis.paused) { speechSynthesis.resume(); setAll("🔊"); b.textContent = "⏸"; return; }
+  // 播放中 → 点同一个按钮暂停，点别的按钮切换
+  if (speechSynthesis.speaking) {
+    if (b === speakState.btn) { speechSynthesis.pause(); b.textContent = "▶️"; return; }
+    speechSynthesis.cancel();
   }
-  if (!window.speechSynthesis) { b.textContent = "❌"; return; }
   var bubble = b.closest(".msg").querySelector(".bubble");
   var clone = bubble.cloneNode(true);
   var tk = clone.querySelector(".think"); if (tk) tk.remove();
-  Array.prototype.forEach.call(clone.querySelectorAll("pre"), function(x){ x.remove(); });
-  var txt = clone.textContent.replace(/\s+/g, " ").trim().slice(0, 3000);
+  var txt = cleanSpeakText(clone);
   if (!txt) return;
-  var u = new SpeechSynthesisUtterance(txt);
-  u.lang = "zh-CN"; u.rate = 1;
+  var parts = chunkSpeak(txt);
+  if (!parts.length) return;
+  var voice = null;
   var vs = speechSynthesis.getVoices();
-  for (var i = 0; i < vs.length; i++){
-    if (/^zh|cmn|Chinese/i.test(vs[i].lang)) { u.voice = vs[i]; break; }
-  }
-  u.onend = function(){ b.textContent = "🔊"; };
-  u.onerror = function(){ b.textContent = "🔊"; };
-  b.textContent = "⏹";
-  speechSynthesis.speak(u);
+  for (var i = 0; i < vs.length; i++) if (/^zh|cmn|Chinese/i.test(vs[i].lang)) { voice = vs[i]; break; }
+  speakState.btn = b;
+  setAll("🔊"); b.textContent = "⏸";
+  parts.forEach(function(part, idx){
+    var u = new SpeechSynthesisUtterance(part);
+    u.lang = "zh-CN"; if (voice) u.voice = voice; u.rate = 1;
+    u.onend = function(){ if (idx === parts.length - 1 && speakState.btn === b) { setAll("🔊"); speakState.btn = null; } };
+    u.onerror = u.onend;
+    speechSynthesis.speak(u);
+  });
 });
+
 
 /* ---------- 图片附件 ---------- */
 var pendingImages = [], askImages = [];
@@ -450,18 +515,24 @@ $("send").onclick = function(){ busy ? stopGen() : send(); };
 
 function mdRender(t){
   var esc = t.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
-  var out = esc
-    .replace(/```(\w*)\n?([\s\S]*?)```/g, function(m,l,c){ return '<pre><code>'+c.replace(/\n$/,"")+'</code></pre>'; });
-  // 流式中未闭合的代码块：尾部剩余 ``` 当场渲染为代码块
-  var open = out.split("```").length - 1;
-  if (open % 2 === 1) {
+  var blocks = [];
+  // 先摘出代码块，避免内部内容被行内规则误伤
+  var out = esc.replace(/```(\w*)\n?([\s\S]*?)```/g, function(mm,l,c){
+    blocks.push('<pre><code>'+c.replace(/\n$/,"")+'</code></pre>');
+    return "\u0000B" + (blocks.length-1) + "\u0000";
+  });
+  var openFence = out.split("```").length - 1;
+  if (openFence % 2 === 1) {
     var idx = out.lastIndexOf("```");
     var lang = out.slice(idx+3).match(/^\w*\n?/)[0];
-    out = out.slice(0, idx) + '<pre><code>' + out.slice(idx+3+lang.length) + '</code></pre>';
+    blocks.push('<pre><code>' + out.slice(idx+3+lang.length).replace(/\n$/,"") + '</code></pre>');
+    out = out.slice(0, idx) + "\u0000B" + (blocks.length-1) + "\u0000";
   }
-  return out
+  out = out
     .replace(/`([^`\n]+)`/g, "<code>$1</code>")
     .replace(/\*\*([^*\n]+)\*\*/g, "<b>$1</b>");
+  out = out.replace(/\u0000B(\d+)\u0000/g, function(mm,i){ return blocks[Number(i)]; });
+  return out;
 }
 function addMsg(role, html){
   var e = $("empty"); if (e) e.remove();
@@ -557,15 +628,22 @@ function ask(text, isRetry){
           return attempt();
         });
       }).catch(function(e2){
+        resetBusy();
         bubble.innerHTML = "⚠ " + esc(e2.message || "自动恢复失败") +
-          '<br><span style="font-size:11px;color:#999">桥接可能未运行：Termux 里执行 sh ~/snake/serve.sh</span>';
+          '<br><span style="font-size:11px;color:#999">桥接可能未运行：Termux 项目目录里执行 sh serve.sh</span>';
       });
       return;
     }
-    var hint = (e.status === 413) ? "图片总体积超限，请减少张数后重试" : "桥接可能未运行：Termux 里执行 sh ~/snake/serve.sh";
+    resetBusy();
+    var hint = (e.status === 413) ? "请求体积超限，请减少图片张数" :
+               (e.status === 429) ? "上一条还在生成中" : "桥接可能未运行：Termux 项目目录里执行 sh serve.sh";
     bubble.innerHTML = "⚠ " + esc(e.message || "请求失败") +
       '<br><span style="font-size:11px;color:#999">' + hint + '</span>';
   });
+  function resetBusy(){
+    busy = false;
+    btn.textContent = "➤"; btn.classList.remove("stop");
+  }
   function finish(){
     if (acc) {
       bubble.innerHTML = (think ? '<div class="think">💭 已深度思考</div>' : "") + mdRender(acc);

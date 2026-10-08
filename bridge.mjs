@@ -18,7 +18,8 @@ function latestSdkPath() {
   return "file://" + path.join(rel, vers.at(-1), "node_modules", "@earendil-works", "pi-coding-agent", "dist", "index.js");
 }
 const SDK = latestSdkPath();
-const { createAgentSession, SessionManager } = await import(SDK);
+const { createAgentSession, SessionManager, ModelRuntime } = await import(SDK);
+const modelRuntime = await ModelRuntime.create().catch(() => null); // 仅用于 setModel 即时切换
 console.log("pi SDK:", SDK.split("/releases/")[1].split("/")[0]);
 // 模型选择：改 ~/.pi/agent/settings.json 的 defaultProvider / defaultModel
 // （当前: agentrouter / gpt-6-astra；GLM 备份在 settings.json.glm-backup）
@@ -28,6 +29,8 @@ const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const CWD = ROOT;
 const SESSION_DIR = path.join(os.homedir(), ".pi", "chat-sessions");
 const META_FILE = path.join(ROOT, "sessions-meta.json");
+const SETTINGS_FILE = path.join(os.homedir(), ".pi", "agent", "settings.json");
+const MODELS_FILE = path.join(os.homedir(), ".pi", "agent", "models.json");
 const MAX_OPENED = 4; // 同时驻留内存的会话数
 
 fs.mkdirSync(SESSION_DIR, { recursive: true });
@@ -35,6 +38,7 @@ fs.mkdirSync(SESSION_DIR, { recursive: true });
 let entries = [];      // 磁盘会话清单（SessionManager.list）
 let opened = new Map();// id -> {id, session, path}（已展开进内存的）
 let busy = false;
+let busyId = null;
 let defaultModel = "未知", defaultProvider = "";
 
 let meta = {}; // id -> {name, updatedAt}
@@ -63,16 +67,28 @@ async function ensureOpened(id) {
   if (opened.has(id)) return opened.get(id);
   const e = entryOf(id);
   if (!e) return null;
-  const { session } = await createAgentSession({
-    sessionManager: SessionManager.open(e.path),
-  });
-  const rec = { id, session, path: e.path };
+  let session;
+  try {
+    ({ session } = await createAgentSession({
+      sessionManager: SessionManager.open(e.path),
+    }));
+  } catch (err) {
+    console.log("会话文件损坏，跳过:", id, err?.message);
+    return null;
+  }
+  const rec = { id, session, path: e.path, lastUsed: Date.now() };
   opened.set(id, rec);
+  rec.lastUsed = Date.now();
   if (opened.size > MAX_OPENED) {
-    const firstKey = opened.keys().next().value;
-    if (firstKey !== id) {
-      try { await opened.get(firstKey).session.dispose(); } catch {}
-      opened.delete(firstKey);
+    let victim = null;
+    for (const [k, r] of opened) {
+      if (k === id || k === busyId) continue; // 不淘汰当前会话与正在生成的会话
+      if (!victim || r.lastUsed < victim.lastUsed) victim = { k, r };
+    }
+    if (victim) {
+      try { await victim.r.session.dispose(); } catch {}
+      opened.delete(victim.k);
+      console.log("LRU 淘汰会话:", victim.k);
     }
   }
   console.log("展开会话:", id, `(内存中 ${opened.size})`);
@@ -122,11 +138,14 @@ const MIME = {
   ".png": "image/png", ".jpg": "image/jpeg", ".svg": "image/svg+xml",
   ".ico": "image/x-icon", ".json": "application/json",
 };
+const STATIC_ALLOWED = new Set(["/chat-pi.html", "/chat.html", "/sudoku.html"]);
 function serveStatic(req, res) {
-  let p = decodeURIComponent(req.url.split("?")[0]);
+  let p;
+  try { p = decodeURIComponent(req.url.split("?")[0]); } catch { res.writeHead(400); return res.end("bad request"); }
   if (p === "/") p = "/chat-pi.html";
-  const file = path.normalize(path.join(ROOT, p));
-  if (file !== ROOT && !file.startsWith(ROOT + path.sep)) { res.writeHead(403); return res.end(); }
+  // 白名单：只放行已知页面，杜绝 sessions-meta.json / .git / 任意文件读取
+  if (!STATIC_ALLOWED.has(p)) { res.writeHead(404); return res.end("Not Found"); }
+  const file = path.join(ROOT, p);
   fs.readFile(file, (err, data) => {
     if (err) { res.writeHead(404); return res.end("Not Found"); }
     res.writeHead(200, { "Content-Type": MIME[path.extname(file)] || "application/octet-stream", "Cache-Control": "no-cache, no-store, must-revalidate" });
@@ -134,7 +153,7 @@ function serveStatic(req, res) {
   });
 }
 
-const server = http.createServer(async (req, res) => {
+async function route(req, res) {
   const u = new URL(req.url, "http://localhost");
   const url = u.pathname;
   const log = (...a) => console.log(new Date().toLocaleTimeString(), ...a);
@@ -194,6 +213,7 @@ const server = http.createServer(async (req, res) => {
 
   if (req.method === "POST" && url === "/chat") {
     let body = "";
+    req.setEncoding("utf8");
     for await (const c of req) {
       body += c;
       if (body.length > 20971520) { res.writeHead(413); return res.end("请求体过大（上限20MB）"); }
@@ -207,6 +227,8 @@ const server = http.createServer(async (req, res) => {
     if (!rec) { res.writeHead(404); return res.end("会话不存在（桥接可能已重启），请新建对话"); }
 
     busy = true;
+    busyId = rec.id;
+    rec.lastUsed = Date.now();
     meta[rec.id] = meta[rec.id] || {};
     if (!meta[rec.id].name || meta[rec.id].name === "新对话") meta[rec.id].name = message.slice(0, 24);
     meta[rec.id].updatedAt = Date.now();
@@ -224,7 +246,7 @@ const server = http.createServer(async (req, res) => {
     });
     const watchdog = setTimeout(() => {
       if (!done) { log("生成超时(5分钟) → 中止"); try { rec.session.abort(); } catch {} }
-    }, 300000);
+    }, 600000);
     const unsub = rec.session.subscribe((e) => {
       const t = e.assistantMessageEvent?.type;
       if (e.type === "message_update" && t === "text_delta") {
@@ -235,16 +257,14 @@ const server = http.createServer(async (req, res) => {
     });
     // 图片附件（最多3张，单张≤4MB base64）
     let images;
-    if (Array.isArray(msg.images)) {
+    if (Array.isArray(msg.images) && msg.images.length) {
+      const OK_TYPES = new Set(["image/png", "image/jpeg", "image/webp", "image/gif"]);
       images = msg.images.slice(0, 3)
-        .filter(im => im && im.data)
-        .map(im => ({
-          type: "image",
-          data: String(im.data),
-          mimeType: im.mediaType || "image/png",
-        }));
+        .filter(im => im && im.data && OK_TYPES.has(im.mediaType) && im.data.length <= 5600000)
+        .map(im => ({ type: "image", data: String(im.data), mimeType: im.mediaType }));
+      if (!images.length) { res.writeHead(400); return res.end("图片无效（仅支持 png/jpeg/webp/gif，单张≤4MB）"); }
     }
-    log("POST /chat", rec.id, `"${message.slice(0, 20)}"${images?.length ? ` +${images.length}图` : ""}`);
+    log("POST /chat", rec.id, `len=${message.length}${images?.length ? " +" + images.length + "图" : ""}`);
     try {
       await rec.session.prompt(message, images?.length ? { images } : undefined);
     } catch (err) {
@@ -254,6 +274,7 @@ const server = http.createServer(async (req, res) => {
     clearTimeout(watchdog);
     done = true;
     busy = false;
+    busyId = null;
     meta[rec.id].updatedAt = Date.now();
     saveMeta();
     log("POST /chat done");
@@ -261,8 +282,57 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (req.method === "POST" && url === "/abort") {
-    if (busy) for (const r of opened.values()) { try { r.session.abort(); } catch {} }
+    let body = "";
+    req.setEncoding("utf8");
+    for await (const c of req) body += c;
+    let aid = null;
+    try { aid = JSON.parse(body || "{}").id; } catch {}
+    if (aid && opened.has(aid)) { try { await opened.get(aid).session.abort(); } catch {} }
+    else if (busy) { for (const r of opened.values()) { try { r.session.abort(); } catch {} } }
     res.writeHead(200); return res.end("ok");
+  }
+
+  if (req.method === "GET" && url === "/models") {
+    let list = [];
+    try {
+      const cfg = JSON.parse(fs.readFileSync(MODELS_FILE, "utf8"));
+      for (const [prov, pc] of Object.entries(cfg.providers || {}))
+        for (const m of pc.models || [])
+          list.push({ provider: prov, model: m.id, name: (m.name || m.id) + " · " + prov });
+    } catch {}
+    let cur = { provider: "", model: "" };
+    try {
+      const st = JSON.parse(fs.readFileSync(SETTINGS_FILE, "utf8"));
+      cur = { provider: st.defaultProvider || "", model: st.defaultModel || "" };
+    } catch {}
+    res.writeHead(200, { "Content-Type": "application/json" });
+    return res.end(JSON.stringify({ list, current: cur }));
+  }
+
+  if (req.method === "POST" && url === "/model") {
+    let body = "";
+    for await (const c of req) { body += c; if (body.length > 4096) { res.writeHead(413); return res.end(); } }
+    let sel; try { sel = JSON.parse(body || "{}"); } catch { sel = {}; }
+    const prov = sel.provider, mid = sel.model;
+    let providers = {};
+    try { providers = JSON.parse(fs.readFileSync(MODELS_FILE, "utf8")).providers || {}; } catch {}
+    const valid = prov && mid && providers[prov] && (providers[prov].models || []).some(m => m.id === mid);
+    if (!valid) { res.writeHead(400); return res.end("未知模型"); }
+    let st = {};
+    try { st = JSON.parse(fs.readFileSync(SETTINGS_FILE, "utf8")); } catch {}
+    st.defaultProvider = prov; st.defaultModel = mid;
+    fs.writeFileSync(SETTINGS_FILE, JSON.stringify(st, null, 2));
+    // 已打开的会话尝试即时切换
+    let live = false;
+    if (sel.id && opened.has(sel.id) && modelRuntime) {
+      try {
+        const mo = modelRuntime.getModel(prov, mid);
+        if (mo) { await opened.get(sel.id).session.setModel(mo); live = true; }
+      } catch (e) { log("setModel 失败(新会话生效):", e?.message); }
+    }
+    log("切换模型:", prov + "/" + mid, live ? "(即时)" : "(新会话生效)");
+    res.writeHead(200, { "Content-Type": "application/json" });
+    return res.end(JSON.stringify({ ok: true, live }));
   }
 
   if (req.method === "GET" && url === "/info") {
@@ -271,7 +341,17 @@ const server = http.createServer(async (req, res) => {
   }
 
   serveStatic(req, res);
+}
+
+const server = http.createServer((req, res) => {
+  route(req, res).catch((e) => {
+    console.log(new Date().toLocaleTimeString(), "Handler 异常:", e?.message || e);
+    try { res.writeHead(500, { "Content-Type": "text/plain; charset=utf-8" }); res.end("服务器内部错误"); } catch {}
+  });
 });
+
+process.on("unhandledRejection", (e) => console.log("[unhandledRejection]", e?.message || e));
+process.on("uncaughtException", (e) => console.log("[uncaughtException]", e?.message || e));
 
 /* ---- 启动 ---- */
 await refreshEntries();
