@@ -4,6 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
 <title>Pi 聊天</title>
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data:;">
 <style>
 :root {
   --app-bg:#f7f7fa; --surface:#fff; --border:#e8e8ee;
@@ -245,6 +246,10 @@ header h1 { font-size:17px; color:var(--text); flex:1; white-space:nowrap; overf
     </select>
   </div>
   <button id="exportBtn">📤 导出当前对话 (.md)</button>
+  <div style="padding:0 12px 8px;flex-shrink:0">
+    <input id="sessionSearch" type="text" placeholder="🔍 搜索会话…" autocomplete="off"
+      style="width:100%;padding:8px 10px;border-radius:8px;border:1px solid var(--input-border);background:var(--input-bg);color:var(--text);font-size:13px;outline:none">
+  </div>
   <div id="sessionList"></div>
 </div>
 
@@ -320,11 +325,32 @@ function initSessions(){
   });
 }
 
+/* ---------- 输入草稿（按会话各自保存/恢复） ---------- */
+var DRAFT_KEY = "pi_drafts";
+function loadDrafts(){
+  try { return JSON.parse(localStorage.getItem(DRAFT_KEY)) || {}; } catch(e){ return {}; }
+}
+function saveDraft(id, text){
+  if (!id) return;
+  var d = loadDrafts();
+  if (text) d[id] = text; else delete d[id];
+  var keys = Object.keys(d);
+  if (keys.length > 30) delete d[keys[0]];
+  try { localStorage.setItem(DRAFT_KEY, JSON.stringify(d)); } catch(e){}
+}
+function restoreDraft(id){
+  input.value = loadDrafts()[id] || "";
+  input.style.height = "auto";
+  input.style.height = Math.min(input.scrollHeight, 120) + "px";
+}
+
 /* ---------- 会话管理 ---------- */
 function renderSessions(){
   var html = "";
-  for (var i=0;i<sessions.length;i++){
-    var s = sessions[i];
+  var kw = (($("sessionSearch") && $("sessionSearch").value) || "").trim().toLowerCase();
+  var list = kw ? sessions.filter(function(s){ return (s.name||"").toLowerCase().indexOf(kw) >= 0; }) : sessions;
+  for (var i=0;i<list.length;i++){
+    var s = list[i];
     var d = new Date(s.updatedAt);
     var t = (d.getMonth()+1) + "/" + d.getDate() + " " +
             ("0"+d.getHours()).slice(-2) + ":" + ("0"+d.getMinutes()).slice(-2);
@@ -336,7 +362,7 @@ function renderSessions(){
       '<button class="del" data-del="' + s.id + '">✕</button>' +
     '</div>';
   }
-  $("sessionList").innerHTML = html || '<div style="padding:30px;text-align:center;color:#bbb;font-size:13px">暂无会话</div>';
+  $("sessionList").innerHTML = html || '<div style="padding:30px;text-align:center;color:#bbb;font-size:13px">' + (kw ? "无匹配会话" : "暂无会话") + '</div>';
 }
 function esc(t){ return String(t).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;"); }
 
@@ -349,12 +375,14 @@ function refreshSessions(){
 }
 
 function openSession(id, silent){
+  saveDraft(currentId, input.value);
   currentId = id;
   localStorage.setItem("pi_active_session", id);
   var s = sessions.find(function(x){ return x.id === id; });
   $("chatTitle").textContent = s ? s.name : "Pi 聊天";
   renderSessions();
   closeDrawer();
+  restoreDraft(id);
   fetch("/history?id=" + encodeURIComponent(id))
     .then(r=>{ if(!r.ok) throw 0; return r.json(); })
     .then(function(msgs){
@@ -403,6 +431,7 @@ function deleteSession(id){
   fetch("/sessions?id=" + encodeURIComponent(id), { method:"DELETE" }).then(function(){
     return refreshSessions();
   }).then(function(){
+    saveDraft(id, "");
     if (id === currentId){
       if (sessions.length) openSession(sessions[0].id);
       else createSession();
@@ -410,6 +439,7 @@ function deleteSession(id){
   }).finally(function(){ deletingSession = false; });
 }
 
+$("sessionSearch").addEventListener("input", renderSessions);
 $("menuBtn").onclick = function(){ $("drawer").classList.add("open"); $("mask").classList.add("show"); refreshSessions(); loadModels(); };
 $("mask").onclick = closeDrawer;
 function closeDrawer(){ $("drawer").classList.remove("open"); $("mask").classList.remove("show"); }
@@ -499,11 +529,9 @@ $("messages").addEventListener("click", function(e){
 /* ---------- 图片附件 ---------- */
 var pendingImages = [], askImages = [];
 $("attachBtn").onclick = function(){ $("fileInput").click(); };
-$("fileInput").addEventListener("change", function(){
-  var files = Array.prototype.slice.call(this.files || []);
-  this.value = "";
-  files.forEach(function(f){
-    if (!/^image\//.test(f.type)) return;
+function addImageFiles(files){
+  Array.prototype.forEach.call(files || [], function(f){
+    if (!f || !/^image\//.test(f.type)) return;
     if (f.size > 20 * 1024 * 1024) { alert("图片不能超过 20MB：" + f.name); return; }
     if (pendingImages.length >= 3) { alert("最多同时附 3 张图片"); return; }
     compressImage(f, function(mediaType, b64){
@@ -511,6 +539,23 @@ $("fileInput").addEventListener("change", function(){
       renderPreviews();
     });
   });
+}
+$("fileInput").addEventListener("change", function(){
+  addImageFiles(this.files);
+  this.value = "";
+});
+/* 粘贴剪贴板图片自动作为附件 */
+$("input").addEventListener("paste", function(e){
+  var items = e.clipboardData && e.clipboardData.items;
+  if (!items) return;
+  var files = [];
+  for (var i = 0; i < items.length; i++){
+    if (/^image\//.test(items[i].type)) {
+      var f = items[i].getAsFile();
+      if (f) files.push(f);
+    }
+  }
+  if (files.length) { e.preventDefault(); addImageFiles(files); }
 });
 
 /* ---------- 复制按钮 ---------- */
@@ -604,6 +649,7 @@ var input = $("input");
 input.addEventListener("input", function(){
   this.style.height = "auto";
   this.style.height = Math.min(this.scrollHeight, 120) + "px";
+  saveDraft(currentId, this.value);
 });
 $("send").onclick = function(){ busy ? stopGen() : send(); };
 
@@ -648,6 +694,7 @@ function send(){
   var imgs = pendingImages.slice();
   pendingImages = []; renderPreviews();
   input.value = ""; input.style.height = "auto";
+  saveDraft(currentId, "");
   addMsg("user", mdRender(text) + (imgs.length ? " 📎×" + imgs.length : ""));
   askImages = imgs;
   ask(text);
@@ -760,7 +807,7 @@ function ask(text, isRetry){
     if (acc) {
       bubble.innerHTML = (think ? '<div class="think">💭 已深度思考</div>' : "") + mdRender(acc);
     } else if (!aborting) {
-      bubble.innerHTML = "（空回复）";
+      bubble.innerHTML = "（空回复：疑似该模型余额不足，点 ☰ 抽屉切换模型）";
     }
     busy = false;
     btn.textContent = "➤"; btn.classList.remove("stop");

@@ -173,6 +173,14 @@ function serveStatic(req, res) {
 }
 
 async function route(req, res) {
+  // CORS: allow browser fetch from localhost (chat-pi.html) + OPTIONS preflight
+  res.setHeader("Access-Control-Allow-Origin", "http://127.0.0.1");
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+  if (req.method === "OPTIONS") {
+    res.writeHead(200);
+    return res.end();
+  }
   const u = new URL(req.url, "http://localhost");
   const url = u.pathname;
   const log = (...a) => console.log(new Date().toLocaleTimeString(), ...a);
@@ -302,6 +310,15 @@ async function route(req, res) {
     log("POST /chat", rec.id, `len=${message.length}${images?.length ? " +" + images.length + "图" : ""}`);
     try {
       await rec.session.prompt(message, images?.length ? { images } : undefined);
+      // pi 遇到 402/额度不足等错误时不抛异常，而是静默返回空内容——主动检测
+      const msgs = rec.session.messages;
+      const lastA = msgs.length ? msgs[msgs.length - 1] : null;
+      if (lastA && lastA.role === "assistant" && (lastA.stopReason === "error" || lastA.errorMessage)) {
+        let em = String(lastA.errorMessage || "生成失败");
+        const qm = em.match(/request id[^)]*\)/);
+        if (qm) em = em.replace(qm[0], "").trim();  // 去掉冗长的 request id
+        send({ t: "error", d: em });
+      }
     } catch (err) {
       send({ t: "error", d: err?.message || String(err) });
     } finally {
