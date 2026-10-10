@@ -122,6 +122,12 @@ header h1 { font-size:17px; color:var(--text); flex:1; white-space:nowrap; overf
 }
 .retry-btn:active { background:var(--item-active,#eef4f8); }
 
+/* ---------- 时间戳/用量 ---------- */
+.msg .time {
+  font-size:10px; color:var(--text-faint);
+  align-self:flex-end; margin:0 2px 2px; white-space:nowrap;
+}
+
 /* ---------- 复制/快捷标签/导出 ---------- */
 .copy-btn {
   border:none; background:none; color:var(--text-faint); font-size:13px;
@@ -527,7 +533,7 @@ $("messages").addEventListener("click", function(e){
 
 
 /* ---------- 图片附件 ---------- */
-var pendingImages = [], askImages = [];
+var pendingImages = [], askImages = [], lastUsage = null;
 $("attachBtn").onclick = function(){ $("fileInput").click(); };
 function addImageFiles(files){
   Array.prototype.forEach.call(files || [], function(f){
@@ -671,6 +677,7 @@ function mdRender(t){
   out = out
     .replace(/`([^`\n]+)`/g, "<code>$1</code>")
     .replace(/\*\*([^*\n]+)\*\*/g, "<b>$1</b>");
+  out = out.replace(/(https?:\/\/[^\s<>"']+)/g, '<a href="$1" target="_blank" rel="noopener">$1</a>');
   out = out.replace(/\u0000B(\d+)\u0000/g, function(mm,i){ return blocks[Number(i)]; });
   return out;
 }
@@ -681,6 +688,10 @@ function addMsg(role, html){
   d.innerHTML = '<div class="bubble">' + html + "</div>";
   $("messages").appendChild(d);
   $("messages").scrollTop = $("messages").scrollHeight;
+  var ts = document.createElement("span");
+  ts.className = "time";
+  ts.textContent = new Date().toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" });
+  d.appendChild(ts);
   return d.querySelector(".bubble");
 }
 function scrollBottom(){ $("messages").scrollTop = $("messages").scrollHeight; }
@@ -745,6 +756,7 @@ function ask(text, isRetry){
               var ev = JSON.parse(line);
               if (ev.t === "text")  { acc  += ev.d; render(); }
               if (ev.t === "think") { think += ev.d; render(); }
+              if (ev.t === "usage") { lastUsage = { input: ev.input || 0, output: ev.output || 0 }; }
               if (ev.t === "error") { throw new Error(ev.d); }
             } catch(e){ if (e instanceof SyntaxError) continue; throw e; }
           }
@@ -811,6 +823,13 @@ function ask(text, isRetry){
     }
     busy = false;
     btn.textContent = "➤"; btn.classList.remove("stop");
+    if (lastUsage && (lastUsage.input || lastUsage.output)) {
+      var usp = document.createElement("span");
+      usp.className = "time";
+      usp.textContent = "(" + lastUsage.input + "+" + lastUsage.output + " tok)";
+      bubble.parentElement.appendChild(usp);
+    }
+    lastUsage = null;
     addSpeakBtn(bubble.parentElement);
     addCopyBtn(bubble.parentElement);
     scrollBottom();
