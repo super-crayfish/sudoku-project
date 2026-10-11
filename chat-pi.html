@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
 <title>Pi 聊天</title>
-<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data:;">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src http://127.0.0.1:* http://localhost:*; img-src data:; base-uri 'none'; form-action 'none';">
 <style>
 :root {
   --app-bg:#f7f7fa; --surface:#fff; --border:#e8e8ee;
@@ -207,7 +207,7 @@ header h1 { font-size:17px; color:var(--text); flex:1; white-space:nowrap; overf
 <div id="app">
   <header>
     <button class="iconbtn" id="menuBtn">☰</button>
-    <h1 id="chatTitle">Pi 聊天</h1>
+    <h1 id="chatTitle">Pi 聊天 <span style="font-size:10px;color:var(--text-faint);font-weight:normal">v251009</span></h1>
     <span id="modelBadge">加载中…</span>
     <button class="iconbtn" id="themeBtn" title="明亮/深色">🌙</button>
     <button class="iconbtn" id="newBtn" title="新对话">✚</button>
@@ -490,7 +490,7 @@ function chunkSpeak(t){
   var segs = t.split(/(。|！|!|？|\?|；|;|\n)/);
   for (var i = 0; i < segs.length; i++){
     cur += segs[i];
-    if (cur.length >= 120 && /[。！！？?；;\n]$/.test(cur)) { out.push(cur); cur = ""; }
+    if (cur.length >= 120 && /[。！？?；;\n]$/.test(cur)) { out.push(cur); cur = ""; }
     else if (cur.length >= 200) { out.push(cur); cur = ""; }
   }
   if (cur.trim()) out.push(cur);
@@ -541,8 +541,10 @@ function addImageFiles(files){
     if (f.size > 20 * 1024 * 1024) { alert("图片不能超过 20MB：" + f.name); return; }
     if (pendingImages.length >= 3) { alert("最多同时附 3 张图片"); return; }
     compressImage(f, function(mediaType, b64){
-      pendingImages.push({ mediaType: mediaType, data: b64 });
-      renderPreviews();
+      if (mediaType && b64) {
+        pendingImages.push({ mediaType: mediaType, data: b64 });
+        renderPreviews();
+      }
     });
   });
 }
@@ -622,18 +624,31 @@ function compressImage(file, done){
     img.onload = function(){
       var MAX = 1600, w = img.width, h = img.height;
       if (w <= MAX && h <= MAX && file.size <= 1024*1024) {
-        done(file.type || "image/png", String(r.result).split(",")[1] || ""); return;
+        var b64 = String(r.result).split(",")[1];
+        done(b64 ? (file.type || "image/png") : "", b64 || ""); 
+        return;
       }
       var scale = Math.min(1, MAX / Math.max(w, h));
       var cv = document.createElement("canvas");
       cv.width = Math.round(w*scale); cv.height = Math.round(h*scale);
-      cv.getContext("2d").drawImage(img, 0, 0, cv.width, cv.height);
-      var out = cv.toDataURL("image/jpeg", 0.8);
-      done("image/jpeg", out.split(",")[1] || "");
+      var ctx = cv.getContext("2d");
+      if (ctx) {
+        ctx.drawImage(img, 0, 0, cv.width, cv.height);
+        try {
+          var out = cv.toDataURL("image/jpeg", 0.8);
+          var b64 = out.split(",")[1];
+          done(b64 ? "image/jpeg" : "", b64 || "");
+        } catch(e) {
+          done("", "");
+        }
+      } else {
+        done("", "");
+      }
     };
-    img.onerror = function(){ done(file.type || "image/png", String(r.result).split(",")[1] || ""); };
+    img.onerror = function(){ done("", ""); };
     img.src = r.result;
   };
+  r.onerror = function(){ done("", ""); };
   r.readAsDataURL(file);
 }
 function renderPreviews(){
@@ -704,11 +719,12 @@ function send(){
   if (!currentId) { createSession(); return; }
   var imgs = pendingImages.slice();
   pendingImages = []; renderPreviews();
+  var userText = text;
   input.value = ""; input.style.height = "auto";
   saveDraft(currentId, "");
-  addMsg("user", mdRender(text) + (imgs.length ? " 📎×" + imgs.length : ""));
+  addMsg("user", mdRender(userText) + (imgs.length ? " 📎×" + imgs.length : ""));
   askImages = imgs;
-  ask(text);
+  ask(userText);
 }
 
 function ask(text, isRetry){
@@ -731,10 +747,12 @@ function ask(text, isRetry){
   }
 
   function attempt(){
+    var reqBody = { message: text, id: currentId };
+    if (askImages && askImages.length) reqBody.images = askImages;
     return fetch("/chat", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ message: text, id: currentId, images: askImages })
+      body: JSON.stringify(reqBody)
     }).then(function(res){
       if (!res.ok) return res.text().then(function(t){
         var err = new Error(t || ("HTTP " + res.status));

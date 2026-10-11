@@ -174,7 +174,6 @@ function serveStatic(req, res) {
 
 async function route(req, res) {
   // CORS: allow browser fetch from localhost (chat-pi.html) + OPTIONS preflight
-  res.setHeader("Access-Control-Allow-Origin", "http://127.0.0.1");
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
   if (req.method === "OPTIONS") {
@@ -191,13 +190,15 @@ async function route(req, res) {
     res.writeHead(403); return res.end("forbidden host");
   }
   const origin = req.headers.origin;
+  let originLocal = false;
   if (origin) {
-    let ok = false;
     try {
       const o = new URL(origin);
-      ok = o.hostname === "127.0.0.1" || o.hostname === "localhost" || o.hostname === "::1" || o.hostname === "[::1]";
+      originLocal = o.hostname === "127.0.0.1" || o.hostname === "localhost" || o.hostname === "::1" || o.hostname === "[::1]";
     } catch {}
-    if (!ok) { res.writeHead(403); return res.end("forbidden origin"); }
+    if (!originLocal && /^http:\/\/(127\.0\.0\.1|localhost|\[::1\])(:\d+)?$/.test(origin)) originLocal = true;
+    if (!originLocal) { res.writeHead(403); return res.end("forbidden origin"); }
+    res.setHeader("Access-Control-Allow-Origin", origin);
   }
 
   if (req.method === "GET" && url === "/sessions") {
@@ -258,7 +259,11 @@ async function route(req, res) {
     req.setEncoding("utf8");
     for await (const c of req) {
       body += c;
-      if (body.length > 10485760) { res.writeHead(413); return res.end("请求体过大（上限10MB）"); }
+      if (body.length > 10485760) { 
+        req.socket.destroy(); 
+        res.writeHead(413); 
+        return res.end("请求体过大（上限10MB）"); 
+      }
     }
     let msg;
     try { msg = JSON.parse(body || "{}"); } catch { msg = {}; }
@@ -297,7 +302,12 @@ async function route(req, res) {
       if (!done) { log("客户端断开 → 中止生成"); try { rec.session.abort(); } catch {} }
     });
     const watchdog = setTimeout(() => {
-      if (!done) { log("生成超时(8分钟) → 中止"); try { rec.session.abort(); } catch {} }
+      if (!done) { 
+        log("生成超时(8分钟) → 中止"); 
+        try { rec.session.abort(); } catch {} 
+        busy = false; 
+        busyId = null;
+      }
     }, 480000);
     const unsub = rec.session.subscribe((e) => {
       const t = e.assistantMessageEvent?.type;
@@ -308,28 +318,40 @@ async function route(req, res) {
       }
     });
     log("POST /chat", rec.id, `len=${message.length}${images?.length ? " +" + images.length + "图" : ""}`);
-    try {
-      await rec.session.prompt(message, images?.length ? { images } : undefined);
-      // pi 遇到 402/额度不足等错误时不抛异常，而是静默返回空内容——主动检测
-      const msgs = rec.session.messages;
-      const lastA = msgs.length ? msgs[msgs.length - 1] : null;
-      if (lastA && lastA.role === "assistant" && (lastA.stopReason === "error" || lastA.errorMessage)) {
-        let em = String(lastA.errorMessage || "生成失败");
-        const qm = em.match(/request id[^)]*\)/);
-        if (qm) em = em.replace(qm[0], "").trim();  // 去掉冗长的 request id
-        send({ t: "error", d: em });
+    const promptOpts = images?.length ? { images } : undefined;
+    const TRANSIENT = /terminated|fetch failed|ECONNRESET|socket hang up|ETIMEDOUT|network/i;
+    // 瞬态网络错误自动重试一次（免费渠道上游经常中途断连）
+    for (let attemptNo = 1; attemptNo <= 2; attemptNo++) {
+      let errMsg = null;
+      try {
+        await rec.session.prompt(message, promptOpts);
+        const msgs = rec.session.messages;
+        const lastA = msgs.length ? msgs[msgs.length - 1] : null;
+        if (lastA && lastA.role === "assistant" && (lastA.stopReason === "error" || lastA.errorMessage)) {
+          let em = String(lastA.errorMessage || "生成失败");
+          const qm = em.match(/request id[^)]*\)/);
+          if (qm) em = em.replace(qm[0], "").trim();
+          errMsg = em;
+        }
+      } catch (err) {
+        errMsg = err?.message || String(err);
       }
-    } catch (err) {
-      send({ t: "error", d: err?.message || String(err) });
-    } finally {
-      unsub();
-      clearTimeout(watchdog);
-      done = true;
-      busy = false;
-      busyId = null;
-      meta[rec.id].updatedAt = Date.now();
-      saveMeta();
+      if (!errMsg) break;
+      if (attemptNo === 2 || !TRANSIENT.test(errMsg)) {
+        send({ t: "error", d: errMsg });
+        break;
+      }
+      send({ t: "think", d: "⚠ 上游连接中断，自动重试中…\n" });
+      log("瞬态错误，2秒后重试:", errMsg.slice(0, 60));
+      await new Promise(r => setTimeout(r, 2000));
     }
+    unsub();
+    clearTimeout(watchdog);
+    done = true;
+    busy = false;
+    busyId = null;
+    meta[rec.id].updatedAt = Date.now();
+    saveMeta();
     log("POST /chat done");
     return res.end();
   }
@@ -364,7 +386,14 @@ async function route(req, res) {
 
   if (req.method === "POST" && url === "/model") {
     let body = "";
-    for await (const c of req) { body += c; if (body.length > 4096) { res.writeHead(413); return res.end(); } }
+    for await (const c of req) { 
+      body += c; 
+      if (body.length > 4096) { 
+        req.socket.destroy(); 
+        res.writeHead(413); 
+        return res.end(); 
+      } 
+    }
     let sel; try { sel = JSON.parse(body || "{}"); } catch { sel = {}; }
     const prov = sel.provider, mid = sel.model;
     let providers = {};
@@ -418,7 +447,7 @@ if (entries.length === 0) {
     defaultProvider = rec.session.model.provider || "";
   }
 }
-prewarm(); // 预热备用会话
+setTimeout(prewarm, 1000); // 延迟预热避免启动阻塞
 server.keepAliveTimeout = 120000;
 server.headersTimeout = 125000;
 server.requestTimeout = 0;
