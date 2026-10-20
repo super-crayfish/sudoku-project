@@ -82,7 +82,7 @@ async function ensureOpened(id) {
   if (opened.size > MAX_OPENED) {
     let victim = null;
     for (const [k, r] of opened) {
-      if (k === id || k === busyId) continue; // 不淘汰当前会话与正在生成的会话
+      if (k === id || k === busyId || k === spareRec) continue; // 不淘汰当前/生成中/备用会话
       if (!victim || r.lastUsed < victim.lastUsed) victim = { k, r };
     }
     if (victim) {
@@ -107,7 +107,7 @@ function newSessionRec() {
       defaultModel = session.model.name || session.model.id || "未知";
       defaultProvider = session.model.provider || "";
     }
-    opened.set(id, { id, session, path: session.sessionFile });
+    opened.set(id, { id, session, path: session.sessionFile, lastUsed: Date.now() });
     meta[id] = { name: "新对话", updatedAt: Date.now() };
     saveMeta();
     await refreshEntries();
@@ -216,9 +216,9 @@ async function route(req, res) {
 
   if (req.method === "POST" && url === "/sessions") {
     // 唯一会话且从未聊过 → 视为幽灵，清掉再建
-    if (entries.length === 1 && nameOf(entries[0].id) === "新对话") {
+    if (entries.length === 1 && nameOf(entries[0].id) === "新对话" && entries[0].id !== busyId && entries[0].id !== spareRec) {
       const ghost = entries[0];
-      try { await ghost.session?.dispose?.(); } catch {}
+      try { await opened.get(ghost.id)?.session.dispose(); } catch {}
       try { fs.unlinkSync(ghost.path); } catch {}
       delete meta[ghost.id]; saveMeta();
       if (opened.has(ghost.id)) opened.delete(ghost.id);
@@ -234,6 +234,8 @@ async function route(req, res) {
     const rec = opened.get(id);          // 内存里的（可能还没落盘）
     const e = entryOf(id);               // 磁盘上的
     if (!rec && !e) { res.writeHead(404); return res.end("no such session"); }
+    if (id === busyId) { res.writeHead(409); return res.end("该会话正在生成中，请先停止"); }
+    if (id === spareRec) spareRec = null;
     if (rec) {
       try { await rec.session.dispose(); } catch {}
       opened.delete(id);
@@ -280,14 +282,15 @@ async function route(req, res) {
     }
     if (!message && !images) { res.writeHead(400); return res.end("empty message"); }
     if (busy) { res.writeHead(429); return res.end("上一条还在生成中，稍等"); }
-    const rec = await ensureOpened(msg.id);
-    if (!rec) { res.writeHead(404); return res.end("会话不存在（桥接可能已重启），请新建对话"); }
-
-    busy = true;
+    busy = true; // 先占位，避免 await 期间并发请求同时通过检查
+    let rec;
+    try { rec = await ensureOpened(msg.id); } catch { rec = null; }
+    if (!rec) { busy = false; res.writeHead(404); return res.end("会话不存在（桥接可能已重启），请新建对话"); }
+    if (rec.id === spareRec) spareRec = null; // 备用会话被使用则不再作为备用
     busyId = rec.id;
     rec.lastUsed = Date.now();
     meta[rec.id] = meta[rec.id] || {};
-    if (!meta[rec.id].name || meta[rec.id].name === "新对话") meta[rec.id].name = message.slice(0, 24);
+    if (!meta[rec.id].name || meta[rec.id].name === "新对话") meta[rec.id].name = (message || "[图片]").slice(0, 24);
     meta[rec.id].updatedAt = Date.now();
     saveMeta();
 
@@ -297,16 +300,16 @@ async function route(req, res) {
       "X-Accel-Buffering": "no",
     });
     const send = (obj) => { try { res.write(JSON.stringify(obj) + "\n"); } catch {} };
-    let done = false;
+    let done = false, stopped = false;
+    rec.stopFlag = () => { stopped = true; };
     res.on("close", () => {
-      if (!done) { log("客户端断开 → 中止生成"); try { rec.session.abort(); } catch {} }
+      if (!done) { stopped = true; log("客户端断开 → 中止生成"); try { rec.session.abort(); } catch {} }
     });
     const watchdog = setTimeout(() => {
       if (!done) { 
-        log("生成超时(8分钟) → 中止"); 
-        try { rec.session.abort(); } catch {} 
-        busy = false; 
-        busyId = null;
+        stopped = true;
+        log("生成超时(8分钟) → 中止");
+        try { rec.session.abort(); } catch {}
       }
     }, 480000);
     const unsub = rec.session.subscribe((e) => {
@@ -336,7 +339,7 @@ async function route(req, res) {
       } catch (err) {
         errMsg = err?.message || String(err);
       }
-      if (!errMsg) break;
+      if (!errMsg || stopped) break; // 用户停止/断开/超时不重试
       if (attemptNo === 2 || !TRANSIENT.test(errMsg)) {
         send({ t: "error", d: errMsg });
         break;
@@ -347,6 +350,7 @@ async function route(req, res) {
     }
     unsub();
     clearTimeout(watchdog);
+    rec.stopFlag = null;
     done = true;
     busy = false;
     busyId = null;
@@ -359,11 +363,12 @@ async function route(req, res) {
   if (req.method === "POST" && url === "/abort") {
     let body = "";
     req.setEncoding("utf8");
-    for await (const c of req) body += c;
+    for await (const c of req) { body += c; if (body.length > 4096) { req.socket.destroy(); return; } }
     let aid = null;
     try { aid = JSON.parse(body || "{}").id; } catch {}
-    if (aid && opened.has(aid)) { try { await opened.get(aid).session.abort(); } catch {} }
-    else if (busy) { for (const r of opened.values()) { try { r.session.abort(); } catch {} } }
+    if (!(aid && opened.has(aid))) aid = busyId; // 未指定时中止正在生成的会话
+    const ar = aid && opened.get(aid);
+    if (ar) { ar.stopFlag?.(); try { await ar.session.abort(); } catch {} }
     res.writeHead(200); return res.end("ok");
   }
 
@@ -386,6 +391,7 @@ async function route(req, res) {
 
   if (req.method === "POST" && url === "/model") {
     let body = "";
+    req.setEncoding("utf8");
     for await (const c of req) { 
       body += c; 
       if (body.length > 4096) { 
@@ -403,7 +409,8 @@ async function route(req, res) {
     let st = {};
     try { st = JSON.parse(fs.readFileSync(SETTINGS_FILE, "utf8")); } catch {}
     st.defaultProvider = prov; st.defaultModel = mid;
-    fs.writeFileSync(SETTINGS_FILE, JSON.stringify(st, null, 2));
+    try { fs.writeFileSync(SETTINGS_FILE, JSON.stringify(st, null, 2)); }
+    catch (e) { res.writeHead(500); return res.end("写入 settings.json 失败"); }
     // 已打开的会话尝试即时切换
     let live = false;
     if (sel.id && opened.has(sel.id) && modelRuntime) {

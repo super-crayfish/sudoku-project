@@ -1,6 +1,7 @@
 #!/data/data/com.termux/files/usr/bin/sh
 # 一键启动本地服务器：sh serve.sh [端口]
-cd "$(dirname "$0")" || exit 1
+DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$DIR" || exit 1
 PORT="${1:-8080}"
 
 # 先清掉旧实例：优先用 PID 文件，避免 pkill 误伤命令行里含同名关键字的进程
@@ -18,7 +19,15 @@ sleep 0.5
 # 防止切到浏览器后 Android 冻结 Termux
 termux-wake-lock 2>/dev/null
 
-nohup node "$HOME/snake/bridge.mjs" "$PORT" > "$HOME/http.log" 2>&1 &
+# 守护模式：桥接进程意外退出时 3 秒内自动拉起
+nohup sh -c '
+trap "exit 0" TERM INT
+while true; do
+  node "'"$DIR"'/bridge.mjs" "'"$PORT"'" >> "'"$HOME"'/http.log" 2>&1
+  echo "$(date) bridge exited, restarting in 3s" >> "'"$HOME"'/http.log"
+  sleep 3
+done
+' > /dev/null 2>&1 &
 echo $! > "$PIDFILE"
 
 # 自检（SDK 加载需要几秒，最多等 20 秒）

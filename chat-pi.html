@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
 <title>Pi 聊天</title>
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src http://127.0.0.1:* http://localhost:*; img-src data:; base-uri 'none'; form-action 'none';">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self' http://127.0.0.1:* http://localhost:*; img-src data:; base-uri 'none'; form-action 'none';">
 <style>
 :root {
   --app-bg:#f7f7fa; --surface:#fff; --border:#e8e8ee;
@@ -370,7 +370,7 @@ function renderSessions(){
   }
   $("sessionList").innerHTML = html || '<div style="padding:30px;text-align:center;color:#bbb;font-size:13px">' + (kw ? "无匹配会话" : "暂无会话") + '</div>';
 }
-function esc(t){ return String(t).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;"); }
+function esc(t){ return String(t).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;").replace(/'/g,"&#39;"); }
 
 function refreshSessions(){
   return fetch("/sessions").then(r=>r.json()).then(function(list){
@@ -392,6 +392,7 @@ function openSession(id, silent){
   fetch("/history?id=" + encodeURIComponent(id))
     .then(r=>{ if(!r.ok) throw 0; return r.json(); })
     .then(function(msgs){
+      if (id !== currentId) return; // 快速切换时丢弃过期响应
       $("messages").innerHTML = "";
       if (!msgs || !msgs.length){
         $("messages").innerHTML = '<div id="empty"><div class="big">🤖</div>新对话已开始</div>';
@@ -404,6 +405,7 @@ function openSession(id, silent){
       scrollBottom();
     })
     .catch(function(){
+      if (id !== currentId) return;
       if (!silent){
         addMsg("err", "⚠ 会话不存在（桥接可能重启过），请新建对话");
       } else {
@@ -434,15 +436,19 @@ function deleteSession(id){
   if (deletingSession) return;
   if (!confirm("删除这个对话？")) return;
   deletingSession = true;
-  fetch("/sessions?id=" + encodeURIComponent(id), { method:"DELETE" }).then(function(){
+  var delOk = true;
+  fetch("/sessions?id=" + encodeURIComponent(id), { method:"DELETE" }).then(function(r){
+    if (!r.ok) { delOk = false; return r.text().then(function(t){ alert("删除失败：" + t); }); }
     return refreshSessions();
   }).then(function(){
+    if (!delOk) return;
     saveDraft(id, "");
     if (id === currentId){
       if (sessions.length) openSession(sessions[0].id);
       else createSession();
     }
-  }).finally(function(){ deletingSession = false; });
+  }).catch(function(){ alert("删除失败：桥接离线？"); })
+  .finally(function(){ deletingSession = false; });
 }
 
 $("sessionSearch").addEventListener("input", renderSessions);
@@ -592,7 +598,7 @@ if ($("quickChips")) $("quickChips").addEventListener("click", function(e){
   var chip = e.target.closest ? e.target.closest(".chip") : null;
   if (!chip) return;
   var text = chip.getAttribute("data-text");
-  if (text) { input.value = text; input.focus(); }
+  if (text) { input.value = text; input.focus(); input.dispatchEvent(new Event("input")); }
 });
 
 /* ---------- 导出对话 ---------- */
@@ -633,6 +639,7 @@ function compressImage(file, done){
       cv.width = Math.round(w*scale); cv.height = Math.round(h*scale);
       var ctx = cv.getContext("2d");
       if (ctx) {
+        ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, cv.width, cv.height); // 透明 PNG 转 JPEG 避免黑底
         ctx.drawImage(img, 0, 0, cv.width, cv.height);
         try {
           var out = cv.toDataURL("image/jpeg", 0.8);
@@ -838,6 +845,8 @@ function ask(text, isRetry){
       bubble.innerHTML = (think ? '<div class="think">💭 已深度思考</div>' : "") + mdRender(acc);
     } else if (!aborting) {
       bubble.innerHTML = "（空回复：疑似该模型余额不足，点 ☰ 抽屉切换模型）";
+    } else {
+      bubble.innerHTML = '<span style="color:var(--text-faint)">（已停止）</span>'; // 清掉残留光标
     }
     busy = false;
     btn.textContent = "➤"; btn.classList.remove("stop");
@@ -857,7 +866,7 @@ function ask(text, isRetry){
 
 function stopGen(){
   aborting = true;
-  fetch("/abort", { method:"POST" });
+  fetch("/abort", { method:"POST", headers:{"content-type":"application/json"}, body: JSON.stringify({ id: currentId }) }).catch(function(){});
 }
 
 /* ---------- 重试按钮 ---------- */
@@ -872,7 +881,7 @@ $("messages").addEventListener("click", function(e){
 });
 
 input.addEventListener("keydown", function(e){
-  if (e.key === "Enter" && !e.shiftKey && matchMedia("(hover:hover)").matches) {
+  if (e.key === "Enter" && !e.shiftKey && !e.isComposing && e.keyCode !== 229 && matchMedia("(hover:hover)").matches) {
     e.preventDefault(); send();
   }
 });
