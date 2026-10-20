@@ -478,9 +478,14 @@ function addCopyBtn(msgDiv){
   msgDiv.appendChild(cb);
 }
 try { speechSynthesis.getVoices(); } catch(e){}
-var speakState = { btn: null };
+var speakState = { btn: null, timer: null, errs: 0 };
 function setSpeakIcons(t){
   Array.prototype.forEach.call(document.querySelectorAll(".speak-btn"), function(x){ x.textContent = t; });
+}
+function stopSpeak(){
+  try { speechSynthesis.cancel(); } catch(e){}
+  if (speakState.timer) { clearInterval(speakState.timer); speakState.timer = null; }
+  setSpeakIcons("🔊"); speakState.btn = null;
 }
 function cleanSpeakText(clone){
   Array.prototype.forEach.call(clone.querySelectorAll("pre"), function(x){ x.remove(); });
@@ -496,47 +501,58 @@ function chunkSpeak(t){
   var segs = t.split(/(。|！|!|？|\?|；|;|\n)/);
   for (var i = 0; i < segs.length; i++){
     cur += segs[i];
-    if (cur.length >= 120 && /[。！？?；;\n]$/.test(cur)) { out.push(cur); cur = ""; }
+    if (cur.length >= 120 && /[。！！？?；;\n]$/.test(cur)) { out.push(cur); cur = ""; }
     else if (cur.length >= 200) { out.push(cur); cur = ""; }
   }
   if (cur.trim()) out.push(cur);
   return out.filter(function(s){ return s.trim(); });
 }
+function speakChunks(parts, b){
+  var i = 0;
+  speakState.btn = b; speakState.errs = 0;
+  setSpeakIcons("🔊"); b.textContent = "⏸";
+  function next(){
+    if (speakState.btn !== b) return;                       // 用户切到别的消息了
+    if (i >= parts.length) {
+      setSpeakIcons("🔊"); speakState.btn = null;
+      if (speakState.timer) { clearInterval(speakState.timer); speakState.timer = null; }
+      return;
+    }
+    var u = new SpeechSynthesisUtterance(parts[i++]);
+    u.lang = "zh-CN"; u.rate = 1;
+    var vs = speechSynthesis.getVoices();
+    for (var k = 0; k < vs.length; k++) if (/^zh|cmn|Chinese/i.test(vs[k].lang)) { u.voice = vs[k]; break; }
+    u.onend = next;
+    u.onerror = function(){
+      speakState.errs++;
+      if (speakState.errs >= 3) { stopSpeak(); return; }    // 连续3段出错才放弃
+      next();                                               // 单段失败跳过继续
+    };
+    // 防 Chrome 长朗读中断：每10秒 pause+resume 心跳一次
+    if (!speakState.timer) speakState.timer = setInterval(function(){
+      if (speechSynthesis.speaking && !speechSynthesis.paused) {
+        try { speechSynthesis.pause(); speechSynthesis.resume(); } catch(e){}
+      }
+    }, 10000);
+    speechSynthesis.speak(u);
+  }
+  next();
+}
 $("messages").addEventListener("click", function(e){
   var b = e.target.closest ? e.target.closest(".speak-btn") : null;
   if (!b || !window.speechSynthesis) return;
-  function setAll(t){ setSpeakIcons(t); }
-  // 暂停中 → 续播
-  if (speechSynthesis.paused) { speechSynthesis.resume(); setAll("🔊"); b.textContent = "⏸"; return; }
-  // 播放中 → 点同一个按钮暂停，点别的按钮切换
+  if (speechSynthesis.paused) { speechSynthesis.resume(); setSpeakIcons("🔊"); b.textContent = "⏸"; return; }
   if (speechSynthesis.speaking) {
     if (b === speakState.btn) { speechSynthesis.pause(); b.textContent = "▶️"; return; }
-    speechSynthesis.cancel();
+    stopSpeak();
   }
   var bubble = b.closest(".msg").querySelector(".bubble");
   var clone = bubble.cloneNode(true);
   var tk = clone.querySelector(".think"); if (tk) tk.remove();
   var txt = cleanSpeakText(clone);
   if (!txt) return;
-  var parts = chunkSpeak(txt);
-  if (!parts.length) return;
-  var voice = null;
-  var vs = speechSynthesis.getVoices();
-  for (var i = 0; i < vs.length; i++) if (/^zh|cmn|Chinese/i.test(vs[i].lang)) { voice = vs[i]; break; }
-  speakState.btn = b;
-  setAll("🔊"); b.textContent = "⏸";
-  var idx = 0;
-  function speakNext(){
-    if (idx >= parts.length) { setAll("🔊"); speakState.btn = null; return; }
-    var u = new SpeechSynthesisUtterance(parts[idx++]);
-    u.lang = "zh-CN"; if (voice) u.voice = voice; u.rate = 1;
-    u.onend = speakNext;
-    u.onerror = function(){ setAll("🔊"); speakState.btn = null; };
-    speechSynthesis.speak(u);
-  }
-  speakNext();
+  speakChunks(chunkSpeak(txt), b);
 });
-
 
 /* ---------- 图片附件 ---------- */
 var pendingImages = [], askImages = [], lastUsage = null;
